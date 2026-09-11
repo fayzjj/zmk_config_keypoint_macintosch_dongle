@@ -172,20 +172,24 @@ static int a320_read_packet(const struct device *dev, int8_t *dx, int8_t *dy) {
     uint8_t buf[A320_PACKET_LEN] = {0};
     uint8_t reg = 0x82;
 
-    int ret;
+    int ret = 0;
 
     k_mutex_lock(&a320_i2c_mutex, K_FOREVER);
 
-    if (i2c_write_dt(&cfg->i2c, &reg, 1) < 0)
+    ret = i2c_write_dt(&cfg->i2c, &reg, 1);
+    if (ret < 0) {
+        LOG_WRN("A320 i2c write failed: %d", ret);
         goto out;
+    }
 
-    if (i2c_burst_read_dt(&cfg->i2c, 0x82, buf, sizeof(buf)) < 0)
+    ret = i2c_burst_read_dt(&cfg->i2c, 0x82, buf, sizeof(buf));
+    if (ret < 0) {
+        LOG_WRN("A320 i2c burst read failed: %d", ret);
         goto out;
+    }
 
     *dx = (int8_t)buf[1];
     *dy = -(int8_t)buf[2];
-
-    return 0;
 
 out:
     k_mutex_unlock(&a320_i2c_mutex);
@@ -406,10 +410,29 @@ static void a320_work_cb(struct k_work *work) {
 }
 
 /* ========= GPIO ISR ========= */
+/* ⭐ NEW: 中断风暴检测 —— 排线松动/芯片故障时电机中断脚可能被拉成持续触发，
+ * 这里按 1 秒窗口统计中断次数，异常高的速率会打印警告，方便从日志里确诊。 */
+static volatile uint32_t isr_count = 0;
+static volatile uint32_t isr_window_start = 0;
+#define A320_ISR_STORM_THRESHOLD 200 /* 正常滑动不可能达到这个速率 */
+
 static void motion_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
     struct a320_data *data = CONTAINER_OF(cb, struct a320_data, motion_cb_data);
+    uint32_t now = k_uptime_get_32();
 
-    last_activity_time = k_uptime_get_32();
+    last_activity_time = now;
+    isr_count++;
+
+    if (now - isr_window_start >= 1000) {
+        if (isr_count > A320_ISR_STORM_THRESHOLD) {
+            LOG_WRN("A320 IRQ STORM: %u interrupts in %ums — check motion pin/connector",
+                    isr_count, now - isr_window_start);
+        } else if (isr_count > 0) {
+            LOG_INF("A320 IRQ rate: %u/%ums", isr_count, now - isr_window_start);
+        }
+        isr_count = 0;
+        isr_window_start = now;
+    }
 
     /* ⭐ 防止 work 堆积 */
     k_work_submit_to_queue(&a320_workq, &data->work);
@@ -432,10 +455,14 @@ static int a320_init(const struct device *dev) {
     const struct a320_config *cfg = dev->config;
     struct a320_data *data = dev->data;
 
-    if (!i2c_is_ready_dt(&cfg->i2c))
+    if (!i2c_is_ready_dt(&cfg->i2c)) {
+        LOG_ERR("A320 I2C bus not ready");
         return -ENODEV;
-    if (!gpio_is_ready_dt(&cfg->motion_gpio))
+    }
+    if (!gpio_is_ready_dt(&cfg->motion_gpio)) {
+        LOG_ERR("A320 motion GPIO not ready");
         return -ENODEV;
+    }
 
     /* ⭐ 初始化 mutex */
     k_mutex_init(&a320_i2c_mutex);
