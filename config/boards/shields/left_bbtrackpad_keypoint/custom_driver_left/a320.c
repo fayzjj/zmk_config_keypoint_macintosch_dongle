@@ -261,8 +261,11 @@ static inline void process_arrow_axis(const struct device *dev, int8_t delta, in
         uint16_t key = (arrow_ticks > 0) ? key_pos : key_neg;
 
         // 触发 key press + release（脉冲）
-        input_report_key(dev, key, 1, true, K_FOREVER);
-        input_report_key(dev, key, 0, true, K_FOREVER);
+        // ⭐ 改为 K_NO_WAIT：避免 input/BLE 队列拥堵时把这个共享的
+        // workqueue 线程（同时也在处理 I2C 轮询和中断）卡住，
+        // 导致整个触控板（含普通移动）跟着一起失灵
+        input_report_key(dev, key, 1, true, K_NO_WAIT);
+        input_report_key(dev, key, 0, true, K_NO_WAIT);
 
         *residue %= divisor;
     }
@@ -383,8 +386,8 @@ static void a320_work_cb(struct k_work *work) {
 
         scroll_residual_x -= out_x;
         scroll_residual_y -= out_y;
-        input_report_rel(dev, INPUT_REL_HWHEEL, out_x, false, K_FOREVER);
-        input_report_rel(dev, INPUT_REL_WHEEL, -out_y, true, K_FOREVER);
+        input_report_rel(dev, INPUT_REL_HWHEEL, out_x, false, K_NO_WAIT);
+        input_report_rel(dev, INPUT_REL_WHEEL, -out_y, true, K_NO_WAIT);
         k_msleep(25);
     } else if (!capslock) {
 
